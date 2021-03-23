@@ -1,0 +1,293 @@
+apiVersion: tekton.dev/v1beta1
+kind: ClusterTask
+metadata:
+  name: s2i-java-runtime-builder
+spec:
+  params:
+    - description: The location of the s2i builder image.
+      name: S2I_BUILDER_IMAGE
+      type: string
+    - default: 'true'
+      description: >-
+        Verify the TLS on the registry endpoint (for push/pull to a non-TLS
+        registry)
+      name: TLSVERIFY
+      type: string
+    - description: Built image name
+      name: BUILD_IMAGE_NAME
+      type: string
+    - description: Runtime image name
+      name: IMAGE_NAME
+      type: string
+  steps:
+    - image: $(params.BUILD_IMAGE_NAME)
+      name: prepare
+      resources: {}
+      script: |
+        #!/bin/bash
+
+        mkdir -p /gen-source/artifacts
+
+        cp -RTv /deployments /gen-source/artifacts
+
+        cat << EOF > /gen-source/Dockerfile.gen -
+        FROM $(params.S2I_BUILDER_IMAGE)
+        USER root
+        COPY /artifacts /deployments/
+        RUN chown -R 1001:0 /deployments
+        USER 1001
+        CMD /usr/local/s2i/run
+        EOF
+
+        cat /gen-source/Dockerfile.gen
+      volumeMounts:
+        - mountPath: /gen-source
+          name: gen-source
+      workingDir: /gen-source
+    - image: 'quay.io/buildah/stable:v1.17.0'
+      name: build
+      resources: {}
+      script: |
+        #!/bin/bash
+
+        ## generate build image using Dockerfile.gen
+        buildah bud \
+          --tls-verify=$(params.TLSVERIFY) --layers \
+          -f /gen-source/Dockerfile.gen \
+          -t $(params.IMAGE_NAME) .
+      securityContext:
+        privileged: true
+      volumeMounts:
+        - mountPath: /var/lib/containers
+          name: varlibcontainers
+        - mountPath: /gen-source
+          name: gen-source
+      workingDir: /gen-source
+    - image: 'quay.io/buildah/stable:v1.17.0'
+      name: push
+      resources: {}
+      script: |
+        #!/bin/bash
+
+        buildah push \
+          --tls-verify=$(params.TLSVERIFY) \
+          $(params.IMAGE_NAME) \
+          docker://$(params.IMAGE_NAME)
+      securityContext:
+        privileged: true
+      volumeMounts:
+        - mountPath: /var/lib/containers
+          name: varlibcontainers
+  volumes:
+    - emptyDir: {}
+      name: varlibcontainers
+    - emptyDir: {}
+      name: gen-source
+---
+apiVersion: tekton.dev/v1beta1
+kind: ClusterTask
+metadata:
+  name: s2i-java-assembler
+spec:
+  params:
+    - description: git url to clone
+      name: GIT_REPO_URL
+      type: string
+    - default: master
+      description: 'git revision to checkout (branch, tag, sha, ref…)'
+      name: GIT_REVISION
+      type: string
+    - default: '1'
+      description: >-
+        performs a shallow clone where only the most recent commit(s) will be
+        fetched
+      name: GIT_REPO_DEPTH
+      type: string
+    - default: 'true'
+      description: >-
+        defines if http.sslVerify should be set to true or false in the global
+        git config
+      name: GIT_SSL_VERIFY
+      type: string
+    - default: 'true'
+      description: defines if the resource should initialize and fetch the submodules
+      name: GIT_SUB_MODULES
+      type: string
+    - description: The location of the s2i builder image
+      name: S2I_BUILDER_IMAGE
+      type: string
+    - default: '-e -P service-build,openshift-build -DskipTests'
+      name: MAVEN_ARGS
+      type: string
+    - default: 'true'
+      description: >-
+        Verify the TLS on the registry endpoint (for push/pull to a non-TLS
+        registry)
+      name: TLSVERIFY
+      type: string
+    - default: '0'
+      description: Log level when running the S2I binary
+      name: LOGLEVEL
+      type: string
+    - description: Built image name
+      name: IMAGE_NAME
+      type: string
+    - default: 'true'
+      description: Log the commands used during execution
+      name: VERBOSE
+      type: string
+  results:
+    - description: The precise commit SHA that was fetched by this Task
+      name: commit
+    - description: The precise URL that was fetched by this Task
+      name: url
+    - description: ''
+      name: commitUserId
+    - description: ''
+      name: commitUserEmail
+  steps:
+    - image: 'gcr.io/tekton-releases/github.com/tektoncd/pipeline/cmd/git-init:v0.18.1'
+      name: fetch-sources
+      resources: {}
+      script: |
+        #!/bin/sh
+
+        set -eu -o pipefail
+
+        if [[ "$(params.VERBOSE)" == "true" ]] ; then
+          set -x
+        fi
+
+        CHECKOUT_DIR="/checkout-source"
+
+        /ko-app/git-init \
+          -url "$(params.GIT_REPO_URL)" \
+          -revision "$(params.GIT_REVISION)" \
+          -refspec "" \
+          -path "$CHECKOUT_DIR" \
+          -sslVerify="$(params.GIT_SSL_VERIFY)" \
+          -submodules="$(params.GIT_SUB_MODULES)" \
+          -depth "$(params.GIT_REPO_DEPTH)"
+        cd "$CHECKOUT_DIR"
+
+        RESULT_SHA="$(git rev-parse HEAD)"
+        COMMITTER_USER="$(git log -1 --pretty=format:'%an' | xargs)"
+        COMMITTER_EMAIL="$(git log -1 --pretty=format:'%ae' | xargs)"
+
+        EXIT_CODE="$?"
+        if [ "$EXIT_CODE" != 0 ] ; then
+          exit $EXIT_CODE
+        fi
+
+        # ensure we don't add a trailing newline to the result
+        echo -n "$RESULT_SHA" > $(results.commit.path)
+        echo -n "$(params.GIT_REPO_URL)" > $(results.url.path)
+        echo -n "$COMMITTER_USER" > $(results.commitUserId.path)
+        echo -n "$COMMITTER_EMAIL" > $(results.commitUserEmail.path)
+      volumeMounts:
+        - mountPath: /checkout-source
+          name: checkout-source
+    - image: 'quay.io/openshift-pipeline/s2i:nightly'
+      name: prepare
+      resources: {}
+      script: >
+        #!/bin/bash
+
+
+        # copy custom maven settings.xml
+
+        if [ "$(workspaces.maven-settings.bound)" == "true" ] && [ -f
+        "$(workspaces.maven-settings.path)/settings.xml" ]; then
+          echo "---> Copying custom maven settings.xml"
+
+          mkdir -p /checkout-source/configuration
+          cp $(workspaces.maven-settings.path)/settings.xml /checkout-source/configuration/
+        fi
+
+
+        /usr/local/bin/s2i \
+          --loglevel=$(params.LOGLEVEL) \
+          build . $(params.S2I_BUILDER_IMAGE) \
+          --env MAVEN_ARGS='$(params.MAVEN_ARGS)' \
+          --as-dockerfile /gen-source/Dockerfile.gen
+      volumeMounts:
+        - mountPath: /gen-source
+          name: gen-source
+        - mountPath: /checkout-source
+          name: checkout-source
+      workingDir: /checkout-source
+    - image: 'quay.io/buildah/stable:v1.17.0'
+      name: build
+      resources: {}
+      script: |
+        #!/bin/bash
+
+        ## s2i scripts are located at /usr/local/s2i and not at /usr/libexec/s2i
+        sed -i 's/libexec/local/g' /gen-source/Dockerfile.gen
+
+        ## generate build image using Dockerfile.gen
+        buildah bud \
+          --tls-verify=$(params.TLSVERIFY) --layers \
+          -f /gen-source/Dockerfile.gen \
+          -t $(params.IMAGE_NAME) .
+      securityContext:
+        privileged: true
+      volumeMounts:
+        - mountPath: /var/lib/containers
+          name: varlibcontainers
+        - mountPath: /gen-source
+          name: gen-source
+      workingDir: /gen-source
+    - image: 'quay.io/buildah/stable:v1.17.0'
+      name: push
+      resources: {}
+      script: |
+        #!/bin/bash
+
+        buildah push \
+          --tls-verify=$(params.TLSVERIFY) \
+          $(params.IMAGE_NAME) \
+          docker://$(params.IMAGE_NAME)
+          
+      securityContext:
+        privileged: true
+      volumeMounts:
+        - mountPath: /var/lib/containers
+          name: varlibcontainers
+  volumes:
+    - emptyDir: {}
+      name: varlibcontainers
+    - emptyDir: {}
+      name: gen-source
+    - emptyDir: {}
+      name: checkout-source
+  workspaces:
+    - name: maven-settings
+      optional: true
+---
+apiVersion: tekton.dev/v1beta1
+kind: ClusterTask
+metadata:
+  generation: 1
+  name: deploy-using-kubectl
+spec:
+  params:
+    - description: The path to the de file to deploy within the  source
+      name: deploymentName
+      type: string
+    - description: namespace of target deployment
+      name: targetNamespace
+      type: string
+  steps:
+    - args:
+        - rollout
+        - restart
+        - deployment
+        - $(params.deploymentName)
+        - '-n'
+        - $(params.targetNamespace)
+      command:
+        - kubectl
+      image: lachlanevenson/k8s-kubectl
+      name: run-kubectl
+      resources: {}
